@@ -23,20 +23,8 @@ N = 30
 IN, OUT = 0, N - 1
 A = nx.to_numpy_array(nx.Graph(contact_pairs), nodelist=range(N))
 
-ETA = 0.01
-ALPHA = 0.005
-T = 40.0
-DT = 0.02
-N_PERIODS = 3
-N_EPOCHS = 10_000
-SEED = 0
 
-SIGMA = 0.0           # training noise
-SIGMA_TEST = 0.0      # testing noise
-MARGIN_CAP = 1.0      # Euler stability guard
-
-
-def input_signal(T=T, dt=DT, n_periods=N_PERIODS):
+def input_signal(T, dt, n_periods):
     n = int(round(T / dt)) + 1
     t = np.linspace(0.0, T, n)
     return t, np.pi + np.pi * signal.sawtooth(2 * np.pi * n_periods * t / T, width=0.5)
@@ -48,14 +36,17 @@ def trapezoid_weights(t):
     w[[0, -1]] *= 0.5
     return w
 
-def make_noise(rng, sigma, n_steps, dt):
+def make_noise(rng, sigma, n_steps, dt, SHARE_NOISE):
     # Euler-Maruyama increments: sigma * sqrt(dt) * N(0, 1) for every oscillator and time step.
-    # The free and clamped runs get INDEPENDENT noise
+    # The free and clamped runs get the same noise if SHARE_NOISE is True, otherwise they get independent noise.
     if sigma == 0:
         z = np.zeros((N, n_steps))
         return z, z
     dWF = sigma * np.sqrt(dt) * rng.standard_normal((N, n_steps))
-    dWC = sigma * np.sqrt(dt) * rng.standard_normal((N, n_steps))
+    if SHARE_NOISE:
+        dWC = dWF
+    else:
+        dWC = sigma * np.sqrt(dt) * rng.standard_normal((N, n_steps))
     return dWF, dWC
 
 @njit(cache=True)
@@ -102,40 +93,55 @@ def contrastive_update(F, C, A, w, alpha, eta):
 def cost(F, target):
     return float(np.mean(1.0 - np.cos(F[OUT] - target)))
 
-def train(n_epochs=N_EPOCHS, alpha=ALPHA, eta=ETA, seed=SEED, sigma=SIGMA, log_every=1000):
+def train(T, DT, N_PERIODS, n_epochs, alpha, eta, seed, sigma, SHARE_NOISE, MARGIN_CAP, log_every=1000):
     rng = np.random.default_rng(seed)
-    t, drive = input_signal()
+    t, drive = input_signal(T, DT, N_PERIODS)
     dt, w = t[1] - t[0], trapezoid_weights(t)
     omega = np.zeros(N)
     K = rng.random((N, N)) * A
     F = np.empty((N, len(t)))
     C = np.empty((N, len(t)))
     hist = np.empty(n_epochs)
-    for ep in tqdm(range(n_epochs)):
+
+    disable_tqdm = False if log_every > 0 else True
+
+    for ep in tqdm(range(n_epochs), disable=disable_tqdm, desc="Training"):
         theta0 = rng.uniform(0, 2 * np.pi, N)
-        dWF, dWC = make_noise(rng, sigma, len(t), dt)
+        dWF, dWC = make_noise(rng, sigma, len(t), dt, SHARE_NOISE)
         run_trial(K, A, theta0, omega, drive, drive, dt, eta, True, IN, OUT, F, C, dWF, dWC)
         hist[ep] = cost(F, drive)
         K += contrastive_update(F, C, A, w, alpha, eta)
         if MARGIN_CAP > 0:
             margin = np.abs(K * A).sum(axis=1) * dt
             K *= np.where(margin > MARGIN_CAP, MARGIN_CAP / margin, 1.0)[:, None]
-        if ep % log_every == 0:
-            tqdm.write(f"ep {ep:6d}  cost {hist[ep]:.4f}  max|K| {np.abs(K * A).max():.1f}")
+        if log_every > 0:
+            if ep % log_every == 0:
+                tqdm.write(f"ep {ep:6d}  cost {hist[ep]:.4f}  max|K| {np.abs(K * A).max():.1f}")
+
     return K, omega, hist
 
-if __name__ == "__main__":
-    K, omega, hist = train()
+def test(K, omega, ETA, T, DT, N_PERIODS, SIGMA_TEST, SHARE_NOISE, th0_seed, noise_seed):
 
-    t, drive = input_signal()
+    t, drive = input_signal(T, DT, N_PERIODS)
     dt = t[1] - t[0]
     F = np.empty((N, len(t)))
     C = np.empty((N, len(t)))
-    th0 = np.random.default_rng(2026).uniform(0, 2 * np.pi, N)
-    dWF, dWC = make_noise(np.random.default_rng(2027), SIGMA_TEST, len(t), dt)
+    th0 = np.random.default_rng(th0_seed).uniform(0, 2 * np.pi, N)
+    dWF, dWC = make_noise(np.random.default_rng(noise_seed), SIGMA_TEST, len(t), dt, SHARE_NOISE)
     run_trial(K, A, th0, omega, drive, drive, dt, ETA, False, IN, OUT, F, C, dWF, dWC)
     out = np.unwrap(F[OUT])
     out += 2 * np.pi * np.round(np.mean(drive - out) / (2 * np.pi))
+
+    return t, drive, out
+
+def main(T, DT, N_PERIODS, ETA, ALPHA, N_EPOCHS, SEED, SIGMA, SIGMA_TEST, SHARE_NOISE, MARGIN_CAP, log_every=1000, th0_seed=2026, noise_seed=2027):
+
+    K, omega, hist = train(T=T, DT=DT, N_PERIODS=N_PERIODS, n_epochs=N_EPOCHS, alpha=ALPHA, eta=ETA, seed=SEED, sigma=SIGMA, SHARE_NOISE=SHARE_NOISE, MARGIN_CAP=MARGIN_CAP, log_every=log_every)
+    t, drive, out = test(K, omega, ETA=ETA, T=T, DT=DT, N_PERIODS=N_PERIODS, SIGMA_TEST=SIGMA_TEST, SHARE_NOISE=SHARE_NOISE, th0_seed=th0_seed, noise_seed=noise_seed)
+
+    return hist, t, drive, out, K
+
+def plot_results(hist, t, drive, out, K):
 
     fig, ax = plt.subplots(1, 2, figsize=(11, 3.8))
     ax[0].plot(hist, lw=0.5)
@@ -186,3 +192,21 @@ if __name__ == "__main__":
     ax.set_title("Contact Network (Weighted DiGraph)")
     ax.axis("off")
     plt.show()
+
+if __name__ == "__main__":
+
+    ETA = 0.01
+    ALPHA = 0.005
+    T = 20.0
+    DT = 0.01
+    N_PERIODS = 1
+    N_EPOCHS = 10_000
+    SEED = 0
+
+    SIGMA = 1.0           # training noise
+    SIGMA_TEST = 1.0      # testing noise
+    MARGIN_CAP = 1.0      # Euler stability guard
+    SHARE_NOISE = False   # whether free and clamped runs share the same noise
+
+    hist, t, drive, out, K = main(T, DT, N_PERIODS, ETA, ALPHA, N_EPOCHS, SEED, SIGMA, SIGMA_TEST, SHARE_NOISE, MARGIN_CAP)
+    plot_results(hist, t, drive, out, K)
